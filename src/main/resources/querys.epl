@@ -1,0 +1,56 @@
+//Expression for computing the distance between 2 points on the pitch
+create expression distance alias for { (p1.x - p2.x)*(p1.x - p2.x) + (p1.y - p2.y)*(p1.y - p2.y)};
+
+//This variable is used for interrupting the game according to the interrruption data
+create variable bool interrupted=false;
+on GameIntStart set interrupted = true;
+on GameIntStop set interrupted = false;
+
+//Dividing the input event into 2 streams, one for the player foots and other for the ball
+insert into BallEvents select x , y,z,  avg(a) as a,avg(ax) as ax,avg(ay) as ay,avg(az) as az, avg(v) as v, avg(vx) as vx, avg(vy) as vy, avg(vz) as vz, ts, sensor_id as ball_id from InputEvent((sensor_id=10 or sensor_id=8 or sensor_id=4 OR sensor_id=12) and ts>=10753295594424116L)#time(10 milliseconds) group by sensor_id output last every 10 milliseconds ;
+insert into PlayerEvents select *, Util.relatedPlayer(sensor_id) as player_id
+from InputEvent(sensor_id!=4 and sensor_id!=8 and sensor_id!=10 and sensor_id!=105 and sensor_id!=106 and sensor_id!=97 and sensor_id!=98 and sensor_id!=99 and sensor_id!=100);
+
+
+create window EverySensor#unique(sensor_id) as PlayerEvents;
+
+on PlayerEvents merge into EverySensor insert select *;
+
+//Setting on the triggering just with the ball events
+create variable boolean ball=false;
+on BallEvents set ball = true;
+on PlayerEvents set ball = false;
+
+//Joining The player positions with the most recent ball event
+//computing the distance between them, just when the acceleration of the ball is increased
+
+insert into PlayerDistance select current_timestamp,
+p2.player_id as player_id, p2.sensor_id as sensor_id, p1.ts as ballId,
+p2.a as sensor_a,  p2.ts as playerId, distance as distance_p, p1.x as x, p1.y as y
+from BallEvents#lastevent as p1, EverySensor as p2
+where ball and p1.a>55000000 and distance<1000000 and p1.x<52470 and p1.x > -50 and p1.y<33965 and p1.y>-33960;
+
+//Taking just the nearest player to the ball
+
+create variable long act_id=0;
+on BallEvents set act_id=ts;
+
+insert into Hit select prev(0, player_id) as player_id, prev(0,distance_p) as distance_p, prev(0,ballId) as ballId, prev(0,playerId) as playerId, current_timestamp as ts, prev(0,x) as x, prev(0,y) as y, prev(0,sensor_id) as sensor_id from PlayerDistance#rank(sensor_id,100, distance_p asc, playerId desc) where ballId=act_id and interrupted=false ; //and ball_out=false; // output last every 500 milliseconds;
+
+
+//Here it creates the event of output for every Hit that is taken
+//just when there is a change in possession
+
+create variable string player_in_poss = "prova";
+
+insert into Possession select current_timestamp as ts, h.player_id as player_id, h.distance_p as distance_p, ballId, playerId from Hit as h where h.player_id!=player_in_poss;
+
+insert into Possession select current_timestamp as ts, "referee" as player_id, 0.0f as distance_p, 0L as ballId, 0L as playerId from GameIntStart;
+
+
+on Hit(player_id!=player_in_poss) as p set player_in_poss = p.player_id;
+
+//Basically count how many times the player has hit the ball
+insert into OutputStream select (prev(1,ts)-10753295)/1000 as ts,prev(1, player_id) as player_id, (p.ts-prev(1,ts))/1000 as time_of_poss from Possession#length(2) as p;
+
+@name('Prova')select ts, player_id, count(*), sum(time_of_poss) from OutputStream group by player_id;
